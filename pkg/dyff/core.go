@@ -93,6 +93,14 @@ func CompareInputFiles(from ytbx.InputFile, to ytbx.InputFile, compareOptions ..
 		compareOption(&compare.settings)
 	}
 
+	// in case Kubernetes mode is enabled, try to compare documents in the YAML
+	// file by their names rather than just by the order of the documents
+	if compare.settings.KubernetesEntityDetection {
+		if result, err := compare.documentNodes(from, to); err == nil {
+			return Report{from, to, result}, nil
+		}
+	}
+
 	if len(from.Documents) != len(to.Documents) {
 		return Report{}, fmt.Errorf("comparing YAMLs with a different number of documents is currently not supported")
 	}
@@ -190,6 +198,128 @@ func (compare *compare) nonNilSameKindNodes(path ytbx.Path, from *yamlv3.Node, t
 	}
 
 	return diffs, err
+}
+
+func (compare *compare) documentNodes(from, to ytbx.InputFile) ([]Diff, error) {
+	var result []Diff
+
+	var createDocumentLookUpMap = func(inputFile ytbx.InputFile) (map[string]*yamlv3.Node, []string, error) {
+		var lookUpMap = make(map[string]*yamlv3.Node)
+		var names []string
+
+		for _, document := range inputFile.Documents {
+			node := document.Content[0]
+
+			kind, err := nameFromPath(node, "kind")
+			if err != nil {
+				return nil, nil, err
+			}
+
+			namespace, err := nameFromPath(node, "metadata.namespace")
+			if err != nil {
+				namespace = "default"
+			}
+
+			name, err := nameFromPath(node, "metadata.name")
+			if err != nil {
+				return nil, nil, err
+			}
+
+			var key = bunt.Sprintf("%s/_%s_/*%s*", kind, namespace, name)
+			names = append(names, key)
+			lookUpMap[key] = node
+		}
+
+		return lookUpMap, names, nil
+	}
+
+	fromLookUpMap, fromNames, err := createDocumentLookUpMap(from)
+	if err != nil {
+		return nil, err
+	}
+
+	toLookUpMap, toNames, err := createDocumentLookUpMap(to)
+	if err != nil {
+		return nil, err
+	}
+
+	removals := []*yamlv3.Node{}
+	additions := []*yamlv3.Node{}
+
+	for key, fromItem := range fromLookUpMap {
+		if toItem, ok := toLookUpMap[key]; ok {
+			// `from` and `to` contain the same `key` -> require comparison
+			diffs, err := compare.objects(
+				ytbx.Path{},
+				followAlias(fromItem),
+				followAlias(toItem),
+			)
+
+			if err != nil {
+				return nil, err
+			}
+
+			result = append(result, diffs...)
+
+		} else {
+			// `from` contain the `key`, but `to` does not -> removal
+			removals = append(removals, fromItem)
+		}
+	}
+
+	for key, toItem := range toLookUpMap {
+		if _, ok := fromLookUpMap[key]; !ok {
+			// `to` contains a `key` that `from` does not have -> addition
+			additions = append(additions, toItem)
+		}
+	}
+
+	diff := Diff{Details: []Detail{}}
+
+	if len(removals) > 0 {
+		diff.Details = append(diff.Details,
+			Detail{
+				Kind: REMOVAL,
+				From: &yamlv3.Node{
+					Kind:    yamlv3.DocumentNode,
+					Content: removals,
+				},
+				To: nil,
+			},
+		)
+	}
+
+	if len(additions) > 0 {
+		diff.Details = append(diff.Details,
+			Detail{
+				Kind: ADDITION,
+				From: nil,
+				To: &yamlv3.Node{
+					Kind:    yamlv3.DocumentNode,
+					Content: additions,
+				},
+			},
+		)
+	}
+
+	if !compare.settings.IgnoreOrderChanges && len(fromNames) == len(toNames) {
+		for i := range fromNames {
+			if fromNames[i] != toNames[i] {
+				diff.Details = append(diff.Details, Detail{
+					Kind: ORDERCHANGE,
+					From: AsSequenceNode(fromNames),
+					To:   AsSequenceNode(toNames),
+				})
+				break
+			}
+		}
+	}
+
+	if len(diff.Details) > 0 {
+		result = append([]Diff{diff}, result...)
+	}
+
+	return result, nil
 }
 
 func (compare *compare) mappingNodes(path ytbx.Path, from *yamlv3.Node, to *yamlv3.Node) ([]Diff, error) {
